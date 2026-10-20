@@ -1,0 +1,1483 @@
+---
+title: "Puremoe: A PMID-Centered R Interface to PubMed and NIH/NLM Literature Data"
+date: "2026-10-20"
+abstract: >
+  Biomedical literature projects commonly begin in PubMed but require data
+  from several additional National Institutes of Health and National Library
+  of Medicine services. These services differ in their interfaces, response
+  formats, batching rules, and data structures. The puremoe package provides a
+  PMID-centered R interface for searching PubMed and retrieving article
+  metadata, iCite metrics and citation links, PubTator3 annotations and
+  relations, and open-access PubMed Central full text. It keeps remote
+  retrieval explicit and provides source-specific local workflows for MeSH
+  keyness, citation snowballing and network construction, and sentence-level
+  context for biomedical entities and relations. We describe the package's
+  design, compare its scope with adjacent R clients, and demonstrate the
+  workflow with a dated corpus on buprenorphine and opioid use disorder. puremoe
+  is intended for moderately sized literature projects that require a
+  structured NIH/NLM-centered corpus without maintaining separate API clients
+  or a local literature index.
+author:
+  - name: Jason Timm
+    affiliation: University of New Mexico Health Sciences
+    address:
+      - Translational Informatics Division
+      - Albuquerque, New Mexico, United States
+    url: https://jaytimm.github.io/puremoe/
+    email: jatimm@salud.unm.edu
+type: package
+output:
+  rjtools::rjournal_article:
+    self_contained: yes
+    toc: no
+bibliography: timm.bib
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 4.5,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(puremoe)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(igraph)
+library(data.table)
+library(ggrepel)
+library(knitr)
+
+journal_kable <- function(
+    ..., wide = FALSE, hold = FALSE, font_size = 7, widths = NULL) {
+  output <- knitr::kable(...)
+  if (knitr::is_latex_output()) {
+    latex_options <- "scale_down"
+    if (hold) {
+      latex_options <- c(latex_options, "hold_position")
+    }
+    output <- kableExtra::kable_styling(
+      output,
+      latex_options = latex_options,
+      font_size = font_size
+    )
+    # Fixed widths wrap long text columns instead of shrinking the table.
+    for (i in which(!is.na(widths))) {
+      output <- kableExtra::column_spec(output, i, width = widths[[i]])
+    }
+    if (wide) {
+      output <- sub("\\begin{table}", "\\begin{table*}", output, fixed = TRUE)
+      output <- sub("\\end{table}", "\\end{table*}", output, fixed = TRUE)
+    }
+  }
+  output
+}
+
+snapshot_file <- "data/puremoe-example.rds"
+live_retrieval <- identical(
+  tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")),
+  "true"
+)
+if (live_retrieval) {
+  retrieval_date <- Sys.Date()
+} else {
+  if (!file.exists(snapshot_file)) {
+    stop("Missing reproducibility snapshot: ", snapshot_file)
+  }
+  list2env(readRDS(snapshot_file), envir = knitr::knit_global())
+}
+```
+
+# Introduction
+
+PubMed is the principal public gateway to the biomedical journal literature,
+but searching it is only one part of many literature-analysis workflows
+[@lu2011pubmed]. PubMed records provide bibliographic metadata and Medical
+Subject Headings (MeSH), the controlled vocabulary used to index MEDLINE
+[@lipscomb2000mesh]. Complementary NIH and NLM services add other forms of
+evidence: iCite supplies article-level citation measures and citation links
+[@hutchins2016rcr], PubTator3 identifies biomedical entities and relations in
+text [@wei2024pubtator], and PubMed Central (PMC) distributes open-access full
+text. PMIDs connect these resources conceptually, yet the resources do not
+share a single programming interface.
+
+The resulting integration work is substantial even when the scientific
+question is modest. Each service has distinct request conventions, batch sizes,
+rate limits, response formats, and data models. An R workflow may therefore need
+to divide the same PMID vector several ways, parse XML, JSON, and BioC data, and
+preserve nested annotations without duplicating articles. Combining citation
+data, controlled vocabulary, and biomedical annotations requires both reliable
+retrieval and representations that remain usable after retrieval.
+
+`puremoe` [@timm2026puremoe] treats this task as a PMID-centered integration
+problem. Its contribution is not a new literature database or search language.
+It turns a PubMed-derived or user-supplied PMID set into reusable R objects that
+can be enriched across selected NIH/NLM services and passed into local workflows
+without hidden retrieval. A compact interface covers PubMed, iCite, PubTator3,
+and PMC [@roberts2001pmc];
+the corresponding local workflows include MeSH keyness, citation-neighborhood
+expansion and network construction, and sentence-level context for biomedical
+entities and relations. Keeping retrieval and local computation separate makes
+the intermediate objects available for inspection, saving, joining, or analysis
+with ordinary R tools.
+
+The package also ships a PubMed-wide snapshot of MeSH descriptor frequencies,
+which supplies the background distribution needed to distinguish descriptors
+that characterize a selected corpus from headings that are merely common
+throughout PubMed.
+
+This article positions `puremoe` among adjacent R clients, describes its
+interface and data model, and demonstrates the workflow with a corpus on
+buprenorphine and opioid use disorder. The final sections discuss
+implementation, performance, reproducibility, and
+the limits of the package's deliberately NIH/NLM-centered scope.
+
+# Existing approaches in R
+
+R already has capable clients for several parts of this workflow. `rentrez`
+provides a general interface to NCBI E-utilities and supports the
+many databases in the Entrez system [@winter2017rentrez]. `easyPubMed`
+[@fantini2025easypubmed] and `pubmedR` [@aria2026pubmedr] focus more directly on
+PubMed retrieval and parsing; `pubmedR` also provides citation-oriented helpers
+and data that can enter a `bibliometrix` workflow. These packages are natural
+choices when PubMed records, rather than coordinated access to several NIH/NLM
+services, are the primary object of interest.
+
+Two broader scholarly-data clients provide important points of comparison.
+`europepmc` [@jahn2023europepmc] exposes the Europe PMC search index, references
+and citing works, annotations, and available full text; the underlying service
+integrates records from multiple life-science sources [@ferguson2021europepmc].
+`openalexR` targets the cross-disciplinary OpenAlex scholarly graph and includes
+operations for retrieving citation neighborhoods [@aria2024openalexr]. Their
+broader indexes can be preferable to a PubMed-centered workflow when source
+breadth or cross-domain citation analysis is the main requirement.
+
+The overlap among these packages does not make their operations equivalent.
+Europe PMC annotations are not identical to direct PubTator3 output, an
+OpenAlex open-access location is not parsed PMC XML, and generic access to an
+Entrez endpoint does not by itself provide a MeSH keyness calculation or an
+evidence-bearing entity relation network. Table 1 therefore records operations
+exposed as native package workflows. “Generic” denotes a task that can be
+constructed through a lower-level interface, rather than a dedicated operation
+with the same returned structure.
+
+```{r package-comparison, echo=FALSE}
+comparison <- tibble::tibble(
+  capability = c(
+    "Direct PubMed/NCBI search",
+    "PubMed abstracts and metadata",
+    "Retrieve an existing PMID set",
+    "NIH iCite metrics and links",
+    "PubTator3 entities and relations",
+    "PMC open-access full text",
+    "MeSH terms in article records",
+    "MeSH thesaurus and tree data",
+    "References and citing works",
+    "Citation snowballing helper",
+    "Ready-to-use citation network",
+    "MeSH corpus keyness",
+    "Sentence-level entity context and evidence network"
+  ),
+  puremoe = c("Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native", "Native"),
+  rentrez = c("Native", "Generic / partial", "Native", "\u2014", "\u2014", "Generic / partial", "Generic / partial", "Generic / partial", "Generic / partial", "\u2014", "\u2014", "\u2014", "\u2014"),
+  easyPubMed = c("Native", "Native", "Native", "\u2014", "\u2014", "\u2014", "Native", "\u2014", "Partial", "\u2014", "\u2014", "\u2014", "\u2014"),
+  pubmedR = c("Native", "Native", "Native", "\u2014", "\u2014", "\u2014", "Native", "\u2014", "Native", "\u2014", "\u2014", "\u2014", "\u2014"),
+  europepmc = c("Partial", "Native", "Native", "\u2014", "Partial", "Native", "Native", "\u2014", "Native", "\u2014", "\u2014", "\u2014", "\u2014"),
+  openalexR = c("\u2014", "Partial", "Partial", "\u2014", "\u2014", "Partial", "\u2014", "\u2014", "Native", "Native", "Partial", "\u2014", "\u2014")
+)
+journal_kable(
+  comparison,
+  align = c("l", rep("c", 6)),
+  caption = paste(
+    "Native, documented capabilities in puremoe and adjacent R packages.",
+    paste0("Documentation was audited for puremoe ",
+           utils::packageVersion("puremoe"), ", rentrez 1.2.4,"),
+    "easyPubMed 3.1.6, pubmedR 1.0.2, europepmc 0.4.3, and",
+    "openalexR 3.1.0."
+  ),
+  wide = TRUE,
+  font_size = 6.5
+)
+```
+
+Several qualifications are important when reading Table 1. `europepmc`
+searches the Europe PMC index, which includes MEDLINE records, rather than
+sending a query to NCBI PubMed. Its annotations are related text-mining data
+but are not a direct PubTator3 client. `rentrez` can reach PMC, MeSH, and NCBI
+link sets through the generic Entrez interface, but users must choose the
+databases and link types and then perform the corresponding parsing and
+analysis. `easyPubMed` can extract references present in PubMed XML; this is not
+a general cited-by service. Finally, OpenAlex works can carry PMIDs and
+open-access locations, but `openalexR` is neither a PubMed client nor a PMC XML
+parser; its snowballing output requires a further step to become a graph.
+
+The comparison is therefore a statement of scope, not a claim that `puremoe`
+replaces these clients. Its narrower contribution is a consistent path through
+selected NIH/NLM literature services followed by local workflows designed for
+the resulting objects. Broader NCBI or scholarly-graph questions remain better
+served by `rentrez` or `openalexR`, while Europe PMC-centered work is naturally
+handled by `europepmc`.
+
+# Package design
+
+Three choices organize the package: PMIDs provide the common key, remote
+retrieval is explicit, and one compact dispatcher exposes endpoint-specific
+operations. Retrieved objects then enter source-specific local workflows rather
+than a general analysis framework.
+
+## PMIDs as the common key
+
+PMIDs are the organizing key rather than an incidental field. Users may begin
+with `search_pubmed()` or supply identifiers collected elsewhere. The same
+character vector is then reusable across PubMed, iCite, and PubTator3. PMC is
+the one qualified case: PMIDs are first resolved to open-access XML locations.
+This organization minimizes identifier reconciliation and makes joins across
+returned tables explicit. Figure 1 summarizes the data flow: remote services
+enrich a common corpus, normalized objects form the boundary of the retrieval
+layer, and local workflows consume those objects.
+
+```{r package-architecture, echo=FALSE, fig.width=8, fig.height=5, out.width="100%", fig.cap="PMID-centered package architecture. Solid arrows show retrieval and transformation; the lower row contains local workflows that make no additional service requests.", fig.alt=if (knitr::is_html_output()) "A flow diagram in which a PubMed query or supplied identifiers lead to a common PMID corpus, four remote data sources, normalized R objects, and three groups of local workflows." else NULL}
+old_par <- par(mar = rep(0.25, 4), xpd = NA)
+plot.new()
+plot.window(xlim = c(0, 1), ylim = c(0, 1))
+
+draw_box <- function(x, y, width, height, label, fill, border = "#3f4f5f") {
+  rect(
+    x - width / 2, y - height / 2,
+    x + width / 2, y + height / 2,
+    col = fill, border = border, lwd = 1.2
+  )
+  text(x, y, label, cex = 0.83)
+}
+
+draw_arrow <- function(x0, y0, x1, y1) {
+  arrows(x0, y0, x1, y1, length = 0.07, lwd = 1.1, col = "#526779")
+}
+
+draw_box(0.50, 0.93, 0.34, 0.09, "PubMed query or supplied identifiers", "#edf4f8")
+draw_box(0.50, 0.78, 0.18, 0.09, "PMID corpus", "#d5e8f2")
+draw_arrow(0.50, 0.885, 0.50, 0.83)
+
+service_x <- c(0.12, 0.37, 0.63, 0.88)
+service_labels <- c("PubMed\nmetadata + MeSH", "iCite\nmetrics + links", "PubTator3\nentities + relations", "PMC\nopen full text")
+for (i in seq_along(service_x)) {
+  draw_arrow(0.50, 0.735, service_x[i], 0.63)
+  draw_box(service_x[i], 0.57, 0.21, 0.12, service_labels[i], "#fff3d6")
+  draw_arrow(service_x[i], 0.51, 0.50, 0.42)
+}
+
+draw_box(0.50, 0.36, 0.42, 0.11, "Normalized R objects\n(tables and structured lists)", "#e8e2f3")
+
+analysis_x <- c(0.20, 0.50, 0.80)
+analysis_labels <- c("MeSH comparison\nand hierarchy", "Citation expansion\nand networks", "Entity context\nand relation evidence")
+for (i in seq_along(analysis_x)) {
+  draw_arrow(0.50, 0.305, analysis_x[i], 0.19)
+  draw_box(analysis_x[i], 0.12, 0.25, 0.13, analysis_labels[i], "#e3f1e5")
+}
+
+par(old_par)
+```
+
+## Retrieval and local workflows
+
+The public retrieval layer consists primarily of `search_pubmed()` and
+`get_records()`. The former resolves a PubMed query to PMIDs; the latter
+dispatches a PMID vector or endpoint-specific identifiers to a selected source.
+Endpoint-specific batching, requests, and parsing remain behind this shared
+surface. The returned tables and lists then enter local workflows designed for
+their source structures, without making additional API requests
+[@timm2026puremoe].
+
+Each local workflow follows the structure of its source. `mesh_keyness()` uses
+retrieved PubMed records, `citation_network()` uses an iCite result already in
+memory, and the PubTator3 context functions use a previously returned
+entity/relation object. These functions accept retrieved data and make no
+further service requests. They return tables that users can save, filter, join,
+or pass to other R tools. Users can therefore revise a threshold, network, or
+display without sending new requests to an upstream service.
+
+## Endpoint schemas
+
+The supported endpoints differ in both their accepted inputs and returned
+objects. Table 2 is generated from `endpoint_info()` rather than maintained as
+a separate handwritten schema, so it describes the installed package version.
+
+```{r endpoint-schemas, echo=FALSE}
+endpoint_names <- puremoe::endpoint_info()
+endpoint_table <- lapply(endpoint_names, function(x) {
+  info <- puremoe::endpoint_info(x)
+  tibble::tibble(
+    endpoint = x,
+    source = info$source,
+    input = info$input,
+    returns = info$returns
+  )
+}) |>
+  bind_rows()
+journal_kable(
+  endpoint_table,
+  caption = "Remote endpoints exposed by the shared retrieval function.",
+  wide = TRUE,
+  font_size = 8,
+  widths = c("2.6cm", "3cm", "3.4cm", "3.6cm")
+)
+```
+
+As Table 2 shows, the `endpoint` argument keeps the public retrieval surface
+small while allowing the implementation to use service-specific request and
+parsing strategies.
+`endpoint_info()` makes those differences inspectable: for each endpoint it
+reports the upstream source, accepted input, returned object, relevant
+parameters, rate-limit guidance, and endpoint-specific notes. This metadata is
+part of the interface rather than a substitute for it; returned objects use
+stable package-level column names even though the remote representations differ.
+
+# Worked example: Buprenorphine and opioid use disorder
+
+The example corpus contains PubMed records explicitly centered on
+buprenorphine and opioid use disorder (OUD). Requiring both concepts in article
+titles supplies a transparent precision rule and keeps the live workflow
+manageable. Buprenorphine is well established in maintenance treatment, and
+comparisons with methadone and other treatment strategies provide a literature
+with chemical, disease, intervention, and outcome concepts
+[@mattick2014buprenorphine]. The example follows one corpus through a connected
+sequence: PubMed defines it, MeSH characterizes it, iCite tests what its title
+wording leaves outside, PubTator3 makes predicted relations inspectable in text,
+and PMC supplies selected full text for deeper reading. The query does not
+define a systematic-review search: in particular, its contemporary title
+wording underrepresents older literature described with terms such as *opioid
+dependence*.
+
+## Corpus definition and article metadata
+
+The workflow first defines a transparent seed set in a reusable form. It begins
+with the literal PubMed query; `search_pubmed()` returns the PMID vector that
+serves as the input to every subsequent enrichment.
+
+```{r define-corpus, echo=c(1, 2), eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+query <- 'buprenorphine[Title] AND "opioid use disorder"[Title]'
+pmids <- puremoe::search_pubmed(query)
+```
+
+The query returned `r length(pmids)` identifiers on
+`r format(retrieval_date, "%Y-%m-%d")`. Recording both the literal query and
+date is necessary because PubMed is a changing index. The example intentionally
+favors a transparent selection rule over maximal recall; later citation
+expansion provides an empirical view of what this narrow wording leaves outside
+the seed set.
+
+The seed PMIDs are passed to the shared retrieval function with the PubMed
+metadata endpoint. The parallelism and delay are explicit retrieval parameters,
+not global package state. Table 3 shows five returned records and the principal
+article-level fields used later in the workflow.
+
+```{r retrieve-abstracts, echo=TRUE, eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+abstracts <- puremoe::get_records(
+  pmids,
+  endpoint = "pubmed_abstracts",
+  cores = 3L,
+  sleep = 1.05
+)
+```
+
+```{r abstract-preview, echo=FALSE}
+abstracts |>
+  select(pmid, year, journal, articletitle) |>
+  slice_head(n = 5L) |>
+  journal_kable(
+    caption = "Example PubMed records returned by the shared retrieval function.",
+    wide = TRUE,
+    hold = TRUE,
+    font_size = 8,
+    widths = c("1.4cm", "0.8cm", "3.4cm", "7cm")
+  )
+```
+
+In Table 3, each returned article occupies one row, while
+nested annotations such as MeSH descriptors are retained in list-columns rather
+than flattened into duplicated article rows. This representation preserves an
+article-level unit for joins and is also the input subsequently consumed by
+`mesh_keyness()`.
+
+The same seeds can acquire complementary evidence without identifier
+reconciliation. Changing only `endpoint` enriches them with citation and
+biomedical text-mining data. Keeping both calls together emphasizes the common
+retrieval pattern and the reuse of one identifier vector.
+
+```{r retrieve-enrichment, eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+icites <- puremoe::get_records(
+  pmids,
+  endpoint = "icites",
+  cores = 3L,
+  sleep = 0.25
+)
+pubtator <- puremoe::get_records(
+  pmids,
+  endpoint = "pubtator",
+  cores = 3L,
+  sleep = 0.34
+)
+```
+
+The iCite result retains one row per seed returned by the upstream service,
+with metrics and citation links in article-level fields and list-columns; it
+becomes the input to both expansion and within-corpus network construction. In
+the reported snapshot, PubMed returned records for
+`r length(unique(abstracts$pmid))` and iCite for
+`r length(unique(icites$pmid))` of the `r length(pmids)` requested PMIDs; corpus
+percentages below use the returned PubMed records. The absent identifiers are
+recorded in the retrieval audit supplied with the article; `get_records()` binds the
+records supplied by the endpoint rather than manufacturing placeholder rows.
+PubTator3 instead returns BioC JSON in
+which passages contain nested entity annotations and a separate document-level
+list contains typed relation assertions. `get_records()` parses that structure
+into two PMID-linked tables: one row per entity mention and one row per predicted
+relation. Entity rows preserve labels, identifiers, offsets, and source
+passages, while relation rows identify their endpoints through mention indices.
+Sentence context is added locally later in the workflow.
+
+## MeSH descriptors and corpus keyness
+
+MeSH characterizes the seeds in controlled-vocabulary terms that extend beyond
+the words used in their titles. The workflow first inspects the vocabulary
+attached to individual records and then compares its corpus prevalence with a
+PubMed-wide reference. `puremoe` supplies the vocabulary, hierarchy, and
+frequency resources needed for both steps as local R objects.
+
+`puremoe` exposes the MeSH vocabulary and its tree placements as two tabular
+resources. The first supports term-to-descriptor lookup; the second preserves
+the potentially multiple hierarchical locations of each descriptor. Tables 4
+and 5 show these two representations for the concepts defining the example.
+
+```{r mesh-resources, echo=c(1, 2), eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+mesh_thesaurus <- puremoe::data_mesh_thesaurus()
+mesh_trees <- puremoe::data_mesh_trees()
+```
+
+```{r mesh-resource-tables, echo=FALSE}
+mesh_examples <- c("Buprenorphine", "Opioid-Related Disorders")
+
+term_lookup <- mesh_thesaurus |>
+  filter(DescriptorName %in% mesh_examples) |>
+  group_by(DescriptorName) |>
+  summarise(
+    DescriptorUI = first(DescriptorUI),
+    entry_terms = paste(head(unique(TermName), 6L), collapse = "; "),
+    .groups = "drop"
+  )
+
+tree_lookup <- mesh_trees |>
+  filter(DescriptorName %in% mesh_examples) |>
+  transmute(
+    DescriptorUI,
+    DescriptorName,
+    tree_location,
+    category = cats,
+    branch = mesh2
+  )
+
+```
+
+```{r mesh-term-table, echo=FALSE}
+journal_kable(
+  term_lookup,
+  caption = "MeSH descriptors and example entry terms.",
+  wide = TRUE,
+  hold = TRUE,
+  font_size = 8,
+  widths = c("3cm", "1.8cm", "7.8cm")
+)
+```
+
+```{r mesh-tree-table, echo=FALSE}
+journal_kable(
+  tree_lookup,
+  caption = "Hierarchical locations of the example descriptors.",
+  wide = TRUE,
+  font_size = 8,
+  widths = c("1.4cm", "2.6cm", "2.6cm", "2.6cm", "3.4cm")
+)
+```
+
+Table 4 connects preferred descriptors to entry terms and supplementary
+concepts. In this example, *Dependence, Opioid* appears as an entry term for
+*Opioid-Related Disorders*, making a terminological bridge that the literal
+title query does not provide. Table 5 represents hierarchical placement
+separately: buprenorphine occupies several chemical branches, while
+opioid-related disorders appears under both disease and psychiatry/psychology
+branches. A single descriptor-to-parent column would lose that multiplicity.
+Keeping both resources as ordinary tables permits direct lookup, joining, and
+aggregation with other R tools.
+
+`mesh_keyness()` compares the proportion of corpus articles indexed with each
+descriptor against its prevalence across PubMed. By default, it uses the
+package's bundled `data_mesh_frequencies` snapshot, making the comparison a
+local operation. In the package version used for this article, that baseline
+was constructed in April 2026
+from 39,703,112 distinct PMIDs in a local PubMed mirror; descriptor metadata
+came from the contemporaneous NLM MeSH thesaurus. Users may supply another
+frequency table when appropriate.
+
+The baseline distinguishes descriptors characteristic of the corpus from broad
+headings that are frequent throughout PubMed, while `min_count` excludes very
+rare corpus descriptors from the ranking.
+
+```{r mesh-keyness, echo=1}
+keyness <- puremoe::mesh_keyness(
+  abstracts,
+  measure = "log_odds",
+  min_count = 5L
+)
+
+top_keyness <- keyness |>
+  filter(direction == "over", is.finite(z)) |>
+  arrange(desc(z), DescriptorName) |>
+  slice_head(n = 6L) |>
+  transmute(
+    Descriptor = DescriptorName,
+    `Corpus articles` = corpus_count,
+    `Corpus (%)` = sprintf("%.1f", 100 * corpus_prop),
+    `PubMed (%)` = sprintf("%.2f", 100 * baseline_prop),
+    `Log odds` = sprintf("%.2f", log_odds),
+    `Standardized z` = sprintf("%.2f", z)
+  )
+
+top_frequency <- keyness |>
+  arrange(desc(corpus_count), DescriptorName) |>
+  slice_head(n = 6L) |>
+  select(DescriptorName, corpus_count)
+
+frequency_labels <- sprintf(
+  "*%s* (%s)",
+  top_frequency$DescriptorName,
+  format(top_frequency$corpus_count, big.mark = ",", scientific = FALSE)
+)
+frequency_summary <- if (length(frequency_labels) == 1L) {
+  frequency_labels
+} else {
+  paste(
+    paste(head(frequency_labels, -1L), collapse = ", "),
+    tail(frequency_labels, 1L),
+    sep = ", and "
+  )
+}
+```
+
+The most frequent MeSH descriptors in this archived corpus were
+`r frequency_summary`. Frequency alone therefore mixes descriptors central to
+the topic with broad indexing categories. Table 6 instead reports the six
+descriptors ranked highest by standardized log odds, together with the keyness
+values and the prevalences being contrasted.
+
+```{r mesh-keyness-table, echo=FALSE}
+top_keyness |>
+  journal_kable(
+    align = c("l", "r", "r", "r", "r", "r"),
+    caption = paste(
+      "MeSH descriptors ranked highest by standardized log odds against",
+      "the PubMed-wide baseline."
+    ),
+    wide = TRUE
+  )
+```
+
+Table 6 elevates treatment-specific descriptors that are unusually concentrated
+in the corpus rather than simply common in biomedical indexing. The contrast
+shows how controlled-vocabulary enrichment can characterize a corpus beyond
+words in titles. The scores are descriptive rankings, not independent
+hypothesis tests or evidence about comparative treatment effectiveness.
+
+## Citation-based corpus exploration
+
+Citation data expose connected literature omitted by the deliberately narrow
+title wording and show how its addition changes the corpus. The iCite result
+already in memory supports two local views: an auditable expansion beyond the
+seeds and a graph of citations within them.
+
+Following references and citing articles is a well-established complement to
+database searching, especially when terminology changes or evidence crosses
+indexing boundaries [@greenhalgh2005snowballing]. Here, candidates must have at
+least two links to the seed neighborhood, and the total returned set is capped
+at 2,000 records.
+
+```{r citation-snowball, echo=1}
+snowball <- puremoe::citation_snowball(
+  icites,
+  direction = "both",
+  min_links = 2L,
+  max_nodes = 2000L
+)
+```
+
+The configured threshold produced `r sum(snowball$seed)` seeds and
+`r sum(!snowball$seed)` candidates, filling the 2,000-record cap. The cap is a
+computational and screening decision, not a claim that the neighborhood is
+exhausted. Separate cited and citing counts expose why each candidate was
+admitted and allow alternative thresholds without another iCite request.
+
+Candidate PMIDs can be sent back through the same PubMed metadata endpoint.
+Table 7 joins those records to their admission counts and lists the strongest
+links to the seed neighborhood. The ordinary joins, sorting, and display code
+are hidden because they are not additional `puremoe` operations.
+
+```{r expansion-metadata, echo=FALSE, eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+expansion_metadata <- puremoe::get_records(
+  snowball$pmid,
+  endpoint = "pubmed_abstracts",
+  cores = 3L,
+  sleep = 1.05
+)
+```
+
+```{r expansion-metadata-table, echo=FALSE}
+ranked_candidates <- snowball |>
+  filter(!seed) |>
+  left_join(
+    expansion_metadata |>
+      select(pmid, year, journal, articletitle),
+    by = "pmid"
+  ) |>
+  arrange(desc(link_count), desc(cited_links), desc(citing_links))
+
+ranked_candidates |>
+  slice_head(n = 10L) |>
+  select(pmid, year, articletitle, cited_links, citing_links, link_count) |>
+  journal_kable(
+    caption = "Highest-ranked articles discovered through citation links.",
+    wide = TRUE,
+    hold = TRUE,
+    font_size = 8,
+    widths = c("1.4cm", "0.8cm", "5.6cm", NA, NA, NA)
+  )
+```
+
+```{r expansion-mesh-shift, echo=FALSE, out.width="100%", fig.cap="Difference in MeSH descriptor prevalence between citation-discovered candidates and the title-defined seed corpus. Positive values indicate higher prevalence among candidates; negative values indicate higher prevalence among seeds.", fig.alt=if (knitr::is_html_output()) "A horizontal bar chart showing differences in MeSH descriptor prevalence between citation-discovered candidates and seed articles." else NULL}
+seed_pmids <- snowball |>
+  filter(seed) |>
+  pull(pmid)
+candidate_pmids <- snowball |>
+  filter(!seed) |>
+  pull(pmid)
+
+seed_profile <- expansion_metadata |>
+  filter(pmid %in% seed_pmids) |>
+  puremoe::mesh_keyness(min_count = 1L)
+candidate_profile <- expansion_metadata |>
+  filter(pmid %in% candidate_pmids) |>
+  puremoe::mesh_keyness(min_count = 1L)
+
+profile_shift <- full_join(
+  seed_profile |>
+    transmute(DescriptorUI, DescriptorName, seed_prop = corpus_prop),
+  candidate_profile |>
+    transmute(
+      DescriptorUI,
+      candidate_name = DescriptorName,
+      candidate_prop = corpus_prop
+    ),
+  by = "DescriptorUI"
+) |>
+  mutate(
+    DescriptorName = coalesce(DescriptorName, candidate_name),
+    seed_prop = replace_na(seed_prop, 0),
+    candidate_prop = replace_na(candidate_prop, 0),
+    change_pp = 100 * (candidate_prop - seed_prop)
+  )
+
+plot_shift <- profile_shift |>
+  arrange(desc(abs(change_pp))) |>
+  slice_head(n = 12L)
+
+ggplot(
+  plot_shift,
+  aes(x = reorder(DescriptorName, change_pp), y = change_pp,
+      fill = change_pp > 0)
+) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, colour = "grey35", linewidth = 0.3) +
+  coord_flip() +
+  scale_fill_manual(values = c(`TRUE` = "#2774AE", `FALSE` = "#B7352D")) +
+  labs(
+    x = NULL,
+    y = "Candidate minus seed prevalence (percentage points)",
+    title = "How citation expansion changes the MeSH profile"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+Table 7 exposes each candidate's admission counts. Several highly connected
+records are trials, reviews, and guidelines that predate most seeds; titles
+using *opioid dependence* appear prominently. Citation expansion thus
+recovers historically connected work that a literal title condition misses.
+Figure 2 complements the ranked candidates by comparing MeSH prevalence in the
+seeds and the citation-discovered set: positive values identify descriptors
+more common among candidates, while negative values identify descriptors
+concentrated in the seeds. Neither link rank nor
+vocabulary shift establishes relevance on its own, but both provide inspectable
+signals for subsequent screening.
+
+The same iCite object can instead be restricted to links within the seed corpus.
+`citation_network()` returns conventional node and edge tables; one additional
+line converts them to an `igraph` object for standard graph summaries.
+
+```{r citation-network, echo=c(1, 2)}
+citation_net <- puremoe::citation_network(icites)
+citation_graph <- graph_from_data_frame(
+  citation_net$edges,
+  directed = TRUE,
+  vertices = citation_net$nodes
+)
+
+network_summary <- tibble::tibble(
+  nodes = vcount(citation_graph),
+  edges = ecount(citation_graph),
+  isolates = sum(degree(citation_graph, mode = "all") == 0L),
+  weak_components = components(citation_graph, mode = "weak")$no
+)
+```
+
+The within-corpus graph contains `r vcount(citation_graph)` nodes and
+`r ecount(citation_graph)` directed edges. The presence of
+`r network_summary$isolates` isolates and
+`r network_summary$weak_components` weak components is itself informative: a
+topically coherent query need not produce a single connected citation
+community. It also cautions against interpreting this graph as complete
+scholarly connectivity, because it contains only iCite links among the retained
+PubMed records. Returning node and edge tables is more useful than printing an
+unlabeled network; users can pass them to `igraph` [@csardi2006igraph] and select
+layouts, filters, or network statistics appropriate to the research question.
+
+## PubTator3 annotations in sentence context
+
+Citation links test the boundary of the seed corpus; the PubTator3 workflow
+returns attention to concepts and predicted relations inside the retrieved
+texts. PubTator3 performs biomedical entity and relation extraction and returns
+its predictions in BioC structures [@wei2024pubtator]. `get_records()` flattens
+those structures into linked entity mention and relation tables.
+`pubtator_context()` then performs a lightweight local NLP operation that
+attaches sentence context, after which `pubtator_cooccurrence()` and
+`pubtator_network()` construct corpus-level summaries. The package does not
+train or run a second biomedical extraction model; its contribution here is
+parsing, alignment, aggregation, and retention of the evidence connecting each
+summary back to the source PMID and sentence.
+
+`pubtator_context()` takes the entity and relation tables returned by
+`get_records(endpoint = "pubtator")`. The BioC response contains passage text
+and document-relative annotation offsets, so the material needed to reconstruct
+context is present, but sentences are not supplied as an analytical table and
+are not attached to relation rows. The function groups passages by PMID and
+title/abstract location, segments each passage into sentences, and records the
+resulting sentence spans. It aligns each entity's document offset with a
+sentence span and adds a sentence identifier plus sentence-relative entity
+coordinates. It then resolves each relation's two mention indices against the
+entity table, adding endpoint text, identifiers, passage locations, and sentence
+identifiers. From those fields it derives `same_sentence` and
+`sentence_distance`. The returned `entities`, `relations`, and `sentences`
+tables therefore make textual proximity directly queryable without another
+service request or a user-written BioC and offset-alignment pipeline.
+
+Once that context exists, `pubtator_cooccurrence()` constructs a local summary
+from the entity table; it does not use or expand PubTator3's predicted relation
+rows. It counts mention pairs within a chosen sentence window. Aggregating
+`by = "type"` describes broad combinations such as chemical--disease mentions,
+whereas `by = "entity"` retains the identifiers and mention labels supplied to
+the function. The latter makes normalization an explicit composition step: the
+article joins PubTator3 identifiers to the MeSH descriptor and supplementary
+concept records loaded for Table 4, while preserving the forms attested in the
+source text. Identifiers from other vocabularies remain unchanged.
+
+```{r pubtator-context}
+context <- puremoe::pubtator_context(pubtator)
+cooccurrence_types <- puremoe::pubtator_cooccurrence(
+  context,
+  window = 0L,
+  by = "type"
+)
+```
+
+```{r pubtator-concept-labels, echo=FALSE}
+mesh_labels <- mesh_thesaurus |>
+  transmute(
+    mesh_ui = as.character(DescriptorUI),
+    mesh_name = as.character(DescriptorName)
+  ) |>
+  distinct()
+
+concept_entities <- context$entities |>
+  mutate(
+    attested_text = text,
+    mesh_ui = sub("^MESH:", "", identifier),
+    mesh_ui = if_else(
+      !is.na(identifier) & grepl("^[CD][0-9]+$", mesh_ui),
+      mesh_ui,
+      NA_character_
+    )
+  ) |>
+  left_join(mesh_labels, by = "mesh_ui") |>
+  mutate(
+    identifier = if_else(
+      !is.na(mesh_name),
+      paste0("MESH:", mesh_ui),
+      identifier
+    ),
+    text = coalesce(mesh_name, text)
+  )
+```
+
+```{r pubtator-concept-cooccurrence}
+cooccurrence_concepts <- puremoe::pubtator_cooccurrence(
+  concept_entities,
+  window = 0L,
+  by = "entity"
+)
+```
+
+```{r pubtator-context-table, echo=FALSE}
+attested_forms <- concept_entities |>
+  filter(!is.na(sentence_id), !is.na(text), nzchar(text)) |>
+  count(type, identifier, text, attested_text, name = "form_n") |>
+  arrange(type, identifier, text, desc(form_n), attested_text) |>
+  group_by(type, identifier, text) |>
+  slice_head(n = 3L) |>
+  summarise(
+    attested = paste(attested_text, collapse = "; "),
+    .groups = "drop"
+  )
+
+forms_x <- attested_forms |>
+  rename(
+    type_x = type,
+    identifier_x = identifier,
+    text_x = text,
+    attested_x = attested
+  )
+forms_y <- attested_forms |>
+  rename(
+    type_y = type,
+    identifier_y = identifier,
+    text_y = text,
+    attested_y = attested
+  )
+
+cooccurrence_display <- cooccurrence_concepts |>
+  left_join(forms_x, by = c("type_x", "identifier_x", "text_x")) |>
+  left_join(forms_y, by = c("type_y", "identifier_y", "text_y")) |>
+  mutate(
+    concept_x = if_else(
+      !is.na(identifier_x) & grepl("^MESH:", identifier_x),
+      paste0(text_x, " [", sub("^MESH:", "", identifier_x), "]"),
+      text_x
+    ),
+    concept_y = if_else(
+      !is.na(identifier_y) & grepl("^MESH:", identifier_y),
+      paste0(text_y, " [", sub("^MESH:", "", identifier_y), "]"),
+      text_y
+    )
+  ) |>
+  slice_head(n = 12L) |>
+  select(type_x, concept_x, attested_x, type_y, concept_y, attested_y, n, n_pmids)
+
+cooccurrence_display |>
+  journal_kable(caption = paste(
+    "Most frequent same-sentence entity pairs after MeSH label resolution.",
+    "Bracketed values are MeSH UIs; attested columns retain source forms."
+  ), wide = TRUE, hold = TRUE, font_size = 7,
+  widths = c("1.1cm", "2.2cm", "1.8cm", "1.1cm", "2.2cm", "1.8cm", NA, NA))
+```
+
+Chemical--disease pairs dominate same-sentence co-occurrence in this corpus,
+appearing `r cooccurrence_types |> filter(type_x == "Chemical", type_y == "Disease") |> pull(n)`
+times across
+`r cooccurrence_types |> filter(type_x == "Chemical", type_y == "Disease") |> pull(n_pmids)` PMIDs.
+For Table 8, forms such as *OUD* and *opioid use disorder* therefore resolve to
+the preferred MeSH label *Opioid-Related Disorders* when PubTator3 supplies the
+corresponding UI. Replacing the working copy's mention label before pairing
+also de-duplicates multiple forms of one mapped concept within a sentence; the
+original forms remain visible in `attested_x` and `attested_y`. Unmapped entity
+types retain their PubTator3 labels and identifiers rather than being forced
+into MeSH. Because both contextualization and the vocabulary join are local,
+users can change the sentence window or inspect unmapped rows without another
+PubTator3 call. Co-occurrence should be interpreted as proximity in text, not
+as a biomedical association.
+
+Relations are aggregated only after sentence context has been attached.
+`pubtator_network()` resolves each endpoint to a node keyed by the PubTator3
+concept identifier when available, with a type-scoped surface form as the
+fallback. Repeated assertions with the same directed endpoints and relation
+type collapse into one edge carrying total assertion, distinct-PMID, and
+same-sentence support counts. A separate evidence table preserves one row per
+original PubTator3 relation, including its PMID, relation identifier, endpoint
+distance, and source sentence when both mentions map to that sentence. The
+function therefore does not predict new relations; it converts PubTator3's
+document-level assertions into graph-ready corpus summaries without discarding
+the rows needed to audit them. Table 9 displays evidence rows for relations
+whose endpoints were mapped to the same sentence.
+
+```{r pubtator-network}
+relation_net <- puremoe::pubtator_network(context)
+```
+
+```{r pubtator-network-labels, echo=FALSE}
+network_nodes <- relation_net$nodes |>
+  mutate(
+    mesh_ui = sub("^MESH:", "", id),
+    mesh_ui = if_else(
+      grepl("^[CD][0-9]+$", mesh_ui),
+      mesh_ui,
+      NA_character_
+    )
+  ) |>
+  left_join(mesh_labels, by = "mesh_ui") |>
+  mutate(
+    concept = if_else(
+      !is.na(mesh_name),
+      paste0(mesh_name, " [", mesh_ui, "]"),
+      label
+    )
+  )
+```
+
+```{r pubtator-network-evidence, echo=FALSE}
+relation_mentions <- context$relations |>
+  transmute(
+    pmid = as.character(pmid),
+    relation_id = as.character(relation_id),
+    from_mention = ent1_text,
+    to_mention = ent2_text
+  ) |>
+  distinct()
+
+same_sentence_evidence <- relation_net$evidence |>
+  filter(same_sentence %in% TRUE, !is.na(sentence), nzchar(sentence)) |>
+  left_join(
+    network_nodes |>
+      transmute(from = id, from_concept = concept),
+    by = "from"
+  ) |>
+  left_join(
+    network_nodes |>
+      transmute(to = id, to_concept = concept),
+    by = "to"
+  ) |>
+  left_join(relation_mentions, by = c("pmid", "relation_id"))
+
+same_sentence_evidence |>
+  slice_head(n = 8L) |>
+  transmute(
+    from_concept,
+    from_mention,
+    to_concept,
+    to_mention,
+    relation_type = if (knitr::is_latex_output()) {
+      gsub("_", " ", relation_type)
+    } else {
+      relation_type
+    },
+    pmid,
+    sentence = paste0(
+      substr(sentence, 1L, if (knitr::is_latex_output()) 100L else 180L),
+      "..."
+    )
+  ) |>
+  journal_kable(caption = paste(
+    "Sentence-level evidence retained for PubTator3 relations after MeSH label resolution.",
+    "Mention columns preserve the source text."
+  ), wide = TRUE, hold = TRUE, font_size = 7,
+  widths = c("1.8cm", "1.7cm", "1.8cm", "1.7cm", "1.3cm", "1cm", "3.2cm"))
+```
+
+The resulting network has `r nrow(relation_net$nodes)` normalized entities and
+`r nrow(relation_net$edges)` edges supported by
+`r nrow(relation_net$evidence)` article-level evidence rows. Evidence is kept
+separate from aggregated edges so that a summary remains traceable to its
+relation label, PMID, mentions, and available sentence anchor. The article-level
+join changes display labels, not relation assertions: a valid MeSH UI receives
+its preferred thesaurus name, while the adjacent mention column records what
+PubTator3 actually linked in the article. Table 9 therefore also shows why this
+design matters. Some rows place clinically relevant concepts in an informative
+sentence, whereas others expose a relation label unsupported by the sentence
+or text misclassified as an entity. PubTator3 relations are model outputs
+[@wei2024pubtator], not validated causal claims; the evidence table makes review
+and filtering possible before a network is used substantively.
+
+Figure 3 turns the evidence-preserving output into a deliberately focused
+display. It retains only same-sentence relations supported by at least two
+distinct PMIDs, excludes Species entities, and shows the one-hop neighborhoods
+of buprenorphine and OUD together with supported relations among their
+neighbors. Selection is based on article support rather than quotas for
+relation classes. Direction remains available in the underlying edge table,
+but arrowheads are suppressed because several displayed relation types are not
+naturally interpreted as directional claims.
+
+```{r pubtator-focal-network, echo=FALSE, fig.width=10, fig.height=7.2, out.width="100%", fig.cap="Supported PubTator3 relation neighborhood around buprenorphine and opioid use disorder (OUD). Nodes are entities and colors distinguish entity types; node size increases with the number of supporting PMIDs. Node labels are the most frequent PubTator3 surface form for each concept, whereas Tables 8 and 9 use MeSH preferred names. Edges are same-sentence PubTator3 relations supported by at least two distinct PMIDs; color and line type distinguish relation classes, and width increases with article support. Species entities are excluded. The display summarizes upstream model predictions and should not be interpreted as a validated biomedical or causal network.", fig.alt=if (knitr::is_html_output()) "A network centered on buprenorphine and opioid use disorder. Chemical entities are blue-green, disease entities are red, and colored solid or dashed edges show types of same-sentence PubTator3 relations supported by at least two articles." else NULL}
+nodes <- data.table::copy(relation_net$nodes)
+excluded_ids <- nodes[type == "Species", id]
+focal_evidence <- data.table::copy(relation_net$evidence)[
+  same_sentence %in% TRUE &
+    !is.na(from) & !is.na(to) &
+    from != to &
+    !from %in% excluded_ids & !to %in% excluded_ids
+]
+
+focal_edges <- focal_evidence[, .(
+  weight = .N,
+  n_pmids = data.table::uniqueN(pmid),
+  n_sentences = data.table::uniqueN(paste(pmid, sentence, sep = "\r"))
+), by = .(from, to, relation_type)][
+  order(-n_pmids, -n_sentences, -weight, relation_type, from, to)
+]
+
+anchor_nodes <- data.table::rbindlist(lapply(c("buprenorphine", "oud"), function(x) {
+  nodes[tolower(label) == x][order(-n_pmids, -n_mentions, id)][1L]
+}))
+anchor_ids <- anchor_nodes$id
+stopifnot(nrow(anchor_nodes) == 2L, !anyNA(anchor_ids))
+
+anchor_edges <- focal_edges[
+  (from %in% anchor_ids | to %in% anchor_ids) & n_pmids >= 2L
+]
+neighbor_ids <- setdiff(unique(c(anchor_edges$from, anchor_edges$to)), anchor_ids)
+neighbor_edges <- focal_edges[
+  from %in% neighbor_ids & to %in% neighbor_ids & n_pmids >= 2L
+]
+plot_edges <- unique(
+  data.table::rbindlist(list(anchor_edges, neighbor_edges), use.names = TRUE),
+  by = c("from", "to", "relation_type")
+)[order(-n_pmids, -n_sentences, -weight, relation_type, from, to)]
+
+selected_ids <- unique(c(anchor_ids, plot_edges$from, plot_edges$to))
+plot_nodes <- nodes[id %in% selected_ids]
+layout_graph <- graph_from_data_frame(
+  unique(plot_edges[, .(from, to)]),
+  directed = FALSE,
+  vertices = plot_nodes
+)
+
+set.seed(47)
+xy <- layout_with_fr(layout_graph, niter = 1500L)
+plot_nodes <- merge(
+  plot_nodes,
+  data.table::data.table(id = V(layout_graph)$name, x = xy[, 1], y = xy[, 2]),
+  by = "id", all.x = TRUE, sort = FALSE
+)
+plot_edges <- merge(
+  plot_edges,
+  plot_nodes[, .(from = id, x, y)],
+  by = "from", all.x = TRUE, sort = FALSE
+)
+plot_edges <- merge(
+  plot_edges,
+  plot_nodes[, .(to = id, xend = x, yend = y)],
+  by = "to", all.x = TRUE, sort = FALSE
+)
+
+node_palette <- c(Chemical = "#4F7C82", Disease = "#B76558", Gene = "#6D8A59",
+                  Mutation = "#B08A4E", CellLine = "#717D82")
+relation_palette <- c(
+  association = "#6F7478", comparison = "#568095", cotreatment = "#8A7857",
+  negative_correlation = "#A45F59", positive_correlation = "#638464"
+)
+relation_linetypes <- c(
+  association = "solid", comparison = "longdash", cotreatment = "dotdash",
+  negative_correlation = "solid", positive_correlation = "solid"
+)
+relation_types <- sort(unique(plot_edges$relation_type))
+relation_labels <- setNames(
+  tools::toTitleCase(gsub("_", " ", relation_types)),
+  relation_types
+)
+
+network_plot <- ggplot() +
+  geom_curve(
+    data = plot_edges,
+    aes(x = x, y = y, xend = xend, yend = yend,
+        colour = relation_type, linetype = relation_type,
+        linewidth = log1p(n_pmids), alpha = log1p(n_pmids)),
+    curvature = 0.10, lineend = "round"
+  ) +
+  geom_point(
+    data = plot_nodes,
+    aes(x = x, y = y, fill = type, size = log1p(n_pmids)),
+    shape = 21, colour = "white", stroke = 0.8
+  ) +
+  geom_label_repel(
+    data = plot_nodes,
+    aes(x = x, y = y, label = label),
+    size = 3.1, colour = "#292D2F", fill = scales::alpha("white", 0.88),
+    label.size = 0, label.padding = grid::unit(0.10, "lines"),
+    label.r = grid::unit(0.08, "lines"), box.padding = 0.30,
+    point.padding = 0.15, min.segment.length = 0,
+    segment.colour = scales::alpha("#60676A", 0.50),
+    segment.size = 0.3, max.overlaps = Inf, seed = 47
+  ) +
+  scale_colour_manual(
+    name = "Relation", values = relation_palette,
+    breaks = relation_types, labels = relation_labels
+  ) +
+  scale_linetype_manual(
+    name = "Relation", values = relation_linetypes,
+    breaks = relation_types, labels = relation_labels
+  ) +
+  scale_fill_manual(name = "Entity", values = node_palette, na.value = "#777F82") +
+  scale_linewidth_continuous(range = c(0.60, 2.2), guide = "none") +
+  scale_alpha_continuous(range = c(0.38, 0.82), guide = "none") +
+  scale_size_continuous(range = c(4.0, 9.0), guide = "none") +
+  coord_equal(clip = "off") +
+  guides(
+    colour = guide_legend(
+      order = 1, nrow = 2,
+      override.aes = list(linewidth = 1.5, alpha = 0.90)
+    ),
+    linetype = "none",
+    fill = guide_legend(order = 2, nrow = 1, override.aes = list(size = 4.5))
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    legend.position = "bottom", legend.box = "vertical",
+    legend.justification = "center",
+    legend.title = element_text(face = "bold", colour = "#353A3C"),
+    legend.text = element_text(colour = "#454B4E"),
+    legend.spacing.y = grid::unit(0.05, "lines"),
+    plot.margin = margin(20, 28, 12, 28)
+  )
+
+network_plot
+```
+
+The focal display makes the value of the returned graph structure visible:
+strongly supported links remain prominent, relation classes retain their
+observed frequency, and every edge can still be traced to the evidence rows
+used for Table 9. The figure is a downstream view of `pubtator_network()`
+output, not an additional extraction or graph-inference method.
+
+## Selective PMC full-text retrieval
+
+The example ends with selected source documents. When abstract metadata and
+annotations are insufficient, seed PMIDs can be resolved to section-level full
+text. This optional step begins by resolving PMIDs to PMC open-data XML
+locations. Here, only the first 20 seed PMIDs are passed to the resolver and no
+more than three resolved articles are downloaded.
+
+```{r pmc-resolution, echo=c(1, 2), eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+pmc_probe_pmids <- head(pmids, 20L)
+pmc_map <- puremoe::pmid_to_ftp(pmc_probe_pmids, verbose = FALSE)
+```
+
+`pmid_to_ftp()` retains its original function name but, in the package version
+used here,
+converts eligible PMIDs to versioned XML URLs in PMC's public S3 cloud
+distribution rather than the retiring FTP/OA API [@nlm2026pmccloud]. The
+resolved URLs can then enter the same `get_records()` interface used elsewhere
+in the article. Table 10 shows the section-level text returned for the selected
+articles.
+
+```{r pmc-fulltext, echo=TRUE, eval=identical(tolower(Sys.getenv("PUREMOE_LIVE_RETRIEVAL", "false")), "true")}
+fulltext_urls <- head(pmc_map$url, 3L)
+fulltext <- puremoe::get_records(
+  fulltext_urls,
+  endpoint = "pmc_fulltext",
+  cores = 1L
+)
+```
+
+```{r pmc-fulltext-table, echo=FALSE}
+if (nrow(fulltext)) {
+  fulltext_display <- fulltext[
+    !is.na(text) & nzchar(text),
+    .SD[{
+      preferred <- grep("abstract|introduction", section, ignore.case = TRUE)
+      if (length(preferred)) preferred[1L] else 1L
+    }],
+    by = pmid
+  ][seq_len(min(.N, 3L))]
+
+  fulltext_display[, text := trimws(gsub("[[:space:]]+", " ", text))]
+  fulltext_display[, text := trimws(sub(
+    "^[[:digit:].[:space:]]*(Abstract|Introduction)[[:space:]]*",
+    "",
+    text,
+    ignore.case = TRUE
+  ))]
+  fulltext_display[, text := ifelse(
+    nchar(text) > 180L,
+    paste0(substr(text, 1L, 180L), "\u2026"),
+    text
+  )]
+
+  fulltext_display[, .(pmid, section, text)] |>
+    journal_kable(
+      caption = "Representative section text from each retrieved PMC article.",
+      wide = TRUE,
+      hold = TRUE,
+      font_size = 8,
+      widths = c("1.4cm", "1.8cm", "9.4cm")
+    )
+}
+```
+
+Three files are sufficient to demonstrate that `pmc_fulltext` converts article
+XML into section-level text; this limit is pedagogical rather than an endpoint
+restriction. Table 10 normalizes whitespace and shortens displayed values.
+Section headings are returned separately in `section`; for display, a leading
+numeric or section label preserved in some source XML is removed when present.
+The complete returned `text` remains unchanged in `fulltext` for downstream
+use. No further text analysis is shown because this example is limited to
+section-level retrieval.
+
+# Implementation and performance
+
+The implementation uses endpoint-specific adapters, source-specific local
+workflows, and conventional R data structures.
+
+## Endpoint adapters and execution
+
+`get_records()` is a dispatcher over endpoint adapters rather than a common
+HTTP request with different URLs. In the package version used here, PubMed and
+iCite requests
+are divided into batches of at most 199 identifiers, PubTator3 requests into 99,
+and PMC full-text requests into five documents. Each adapter constructs the
+request expected by its service, parses the response, and returns a stable
+package-level representation. PubMed XML becomes an article table with nested
+fields; iCite JSON becomes an article table with citation-link list-columns;
+PubTator3 BioC data become related entity and relation tables; and PMC's
+JATS-formatted XML from the public cloud distribution becomes section-level
+text [@nlm2026pmccloud]. BioC was created specifically to support portable
+biomedical text and annotation exchange [@comeau2013bioc], but its document,
+passage, annotation, and relation hierarchy still requires an R representation
+suited to downstream analysis.
+
+Independent batches can be evaluated on a user-selected number of parallel
+workers. The `sleep` argument remains exposed because parallel execution does
+not waive an upstream service's request policy. The delay is applied within
+each worker, so an approximate aggregate ceiling is `cores / sleep` requests
+per second; callers must choose both values together. The PubMed calls above
+use three workers and a 1.05-second delay to remain below NCBI's documented
+three-request-per-second limit even without a key. The iCite and PubTator3 calls
+used three workers with delays of 0.25 and 0.34 seconds, approximate aggregate
+ceilings of 12 and 9 requests per second; users should check each service's
+current guidance when choosing these values. NCBI API keys are passed through
+where applicable, and an iCite-specific timeout can be set by argument or
+package option. These controls are kept at the retrieval boundary; local
+functions do not need cores, credentials, sleeps, or retry settings.
+`endpoint_info()` records these endpoint differences alongside the input and
+return schemas so that the compact dispatcher does not conceal
+service-specific behavior.
+
+## Inspectable local workflows
+
+The local workflows remove recurring source-specific wrangling without
+attempting to supply a general literature-analysis framework. Their functions
+take explicit retrieved objects as inputs, return tables rather than hidden
+state, and preserve enough source detail to trace a summary back to the records
+that produced it. The three workflow families apply that contract to different
+source structures.
+
+`mesh_keyness()` compares corpora at the article level, not by counting repeated
+labels. It contrasts article-level descriptor prevalence with a PubMed-wide
+frequency baseline. The worked example ranks descriptors with a smoothed,
+standardized log-odds score. Positive values identify descriptors that are
+unusually prevalent in the selected corpus. These descriptive scores depend on
+the corpus and baseline version.
+
+The two citation functions retain different links. `citation_snowball()` ranks
+records outside the seeds by their cited and citing links to the seed
+neighborhood. It then applies the requested direction, threshold, and
+`max_nodes` limit. `citation_network()` keeps only links whose endpoints occur
+inside the retrieved corpus. Both return the links underlying their summaries.
+Users can thus inspect admissions, change thresholds, or construct a graph
+without retrieving iCite data again.
+Edges follow citation flow: `from` is the citing PMID and `to` is the cited
+PMID. Accordingly, `cited_links` counts seed-to-reference edges and
+`citing_links` counts candidate-to-seed edges; `link_count` is the selected
+directional count or their sum. Network nodes are the PMIDs returned by iCite,
+including isolates, while edges are deduplicated links whose two endpoints both
+belong to that node set.
+
+`pubtator_context()` restores textual context to upstream PubTator3 predictions.
+The sentence and offset alignment described in the worked example supports two
+outputs: co-occurrence summaries calculated from mapped entities and relation
+networks that aggregate PubTator3 predictions. The relation networks retain
+separate article- and sentence-level evidence rows. These rows allow users to
+review useful annotations and extraction errors before substantive
+interpretation.
+
+## Scale and interoperable representations
+
+Remote work scales primarily with the number of endpoint-specific batches.
+Parallel workers can process independent batches, but useful concurrency remains
+bounded by service request policies, network availability, and the configured
+delay. Local workflows make no additional requests; their cost instead follows
+the number of article descriptors, citation edges, entity mentions, or relations
+in the retrieved object. PMC work is optional and potentially more
+request-intensive, so users should resolve only the subset selected for
+full-text analysis. These constraints make `puremoe` appropriate for moderate,
+investigator-scale corpora rather than reconstruction of PubMed or a global
+citation graph.
+
+Most retrieval functions return `data.table` objects [@barrett2025datatable]
+with PMIDs stored as character values. This avoids treating identifiers as
+quantities and permits ordinary joins, grouping, and export. List-columns
+preserve genuinely nested information, such as per-article MeSH annotations and
+iCite links, without duplicating article metadata. PubTator3 and network
+operations return named lists of tables when several related components are
+required. No hidden session object connects stages: the returned objects are
+the interface between retrieval, local workflows, and subsequent analysis.
+
+The package likewise does not impose custom graph or visualization classes.
+`citation_network()` returns node and edge tables that can be passed directly to
+`igraph`, as shown above, or to another graph package. `puremoe` prepares the
+literature data while established R tools supply graphical style and statistical
+modeling. Intermediate results therefore remain usable even when the rest of an
+analysis does not use `puremoe`.
+
+## Reproducibility record
+
+The submitted article renders from the dated object
+`data/puremoe-example.rds` by default. The accompanying
+`scripts/retrieve-data.R` script records the literal query and retrieval
+parameters, repeats every remote request displayed in the article, writes an
+endpoint return audit, and replaces the snapshot when a fresh live run is
+required. All transformations, tables, and figures are evaluated from the
+archived objects during the default build. This separates reproducibility of
+the reported results from availability and later changes in upstream services
+without concealing how the records were obtained.
+
+```{r reproducibility-record, echo=FALSE}
+reproducibility_record <- tibble::tibble(
+  Item = c(
+    "Retrieval date", "puremoe version (retrieval)",
+    "puremoe version (render; CRAN)", "R version", "Platform",
+    "Retrieval workers", "NCBI API key used"
+  ),
+  Value = c(
+    format(snapshot_metadata$retrieval_date, "%Y-%m-%d"),
+    snapshot_metadata$puremoe_version,
+    as.character(utils::packageVersion("puremoe")),
+    snapshot_metadata$r_version,
+    snapshot_metadata$platform,
+    as.character(snapshot_metadata$cores),
+    if (isTRUE(snapshot_metadata$ncbi_api_key_used)) "Yes" else "No"
+  )
+)
+journal_kable(
+  reproducibility_record,
+  caption = "Environment and retrieval settings for the archived article snapshot.",
+  hold = TRUE
+)
+```
+
+The submission also includes `data/retrieval-sessionInfo.txt`,
+`data/render-sessionInfo.txt`, and `data/retrieval-audit.csv` as plain-text
+records. The first session record describes the original remote retrieval;
+the second describes the environment used for the submitted render and local
+workflows. A live build remains
+available by setting the `PUREMOE_LIVE_RETRIEVAL` environment variable to
+`true`, but it is expected to
+produce a later state of the upstream indexes rather than reproduce the dated
+counts exactly.
+
+# Limitations
+
+`puremoe` depends on services that the package does not control. Availability,
+latency, schemas, rate limits, and indexing schedules may change. A valid live
+workflow can therefore be interrupted by an upstream outage, and the same query
+can yield different PMIDs on a later date. The article reports its retrieval
+date rather than presenting the current counts as fixed.
+
+Saving retrieved objects can make downstream local workflows repeatable, but it
+does not make a changing external index historically immutable.
+
+iCite links describe a PMID-based citation collection rather than a universal
+scholarly graph, and the PMC endpoint retrieves open-data XML rather than
+arbitrary publisher full text. These upstream boundaries also bound the local
+workflows that `puremoe` can support.
+
+The local summaries reflect upstream metadata and automated annotations; they
+do not validate them. MeSH keyness depends on MEDLINE indexing and the packaged
+frequency baseline. Citation counts favor work with more time and opportunity
+to accumulate links, and expansion thresholds can exclude weakly connected but
+relevant articles. Same-sentence co-occurrence is not semantic association, and
+PubTator3 relation labels may contain entity or relation-extraction errors.
+Evidence rows support review but do not replace domain validation.
+
+The package is intended for moderate, investigator-scale corpora. Parallel
+batching reduces wall-clock time but does not turn remote APIs into bulk data
+infrastructure; large or repeated analyses may be better served by local
+archives or bulk datasets. `puremoe` is not a PubMed mirror, a general interface
+to every NCBI database, a systematic-review management system, or a global
+scholarly graph. The worked query is deliberately precise and pedagogical. Its
+results demonstrate software behavior and corpus exploration, not an exhaustive
+search or synthesis of buprenorphine evidence.
+
+# Discussion
+
+`puremoe` occupies a middle position between individual API clients and large
+bibliometric infrastructures. Its defining contribution is a reusable PMID
+corpus that can move through selected NIH/NLM services and then enter
+source-specific, inspectable local workflows. This supplies more workflow
+structure and biomedical-domain support than a generic request client while
+avoiding the storage and maintenance requirements of a literature mirror. In
+the worked example, each service response becomes an ordinary R object with an
+explicit relationship to the seeds.
+
+The example also shows why combining these sources is analytically useful.
+MeSH descriptors summarize the seed corpus in a controlled vocabulary and link
+current language to older entry terms. Citation expansion then recovers highly
+connected trials, reviews, and guidelines outside the literal title query,
+including work framed as *opioid dependence*. The seed--candidate MeSH contrast
+describes how that expansion changes the corpus rather than merely enlarging
+it. PubTator3 adds a different view based on concepts in text, while retained
+sentence evidence exposes both potentially useful relations and obvious reasons
+for caution. A small PMC subset demonstrates sectioned full text without
+turning that optional endpoint into a corpus-wide download.
+
+These gains occur at the transitions between services. PubMed annotations feed
+a comparison against a PubMed-wide baseline; iCite links support both a ranked
+candidate table and a graph; PubTator3 offsets become sentence context before
+evidence is aggregated. These local workflows go beyond returning upstream
+JSON, XML, or BioC, yet remain inspectable rather than forming an opaque
+end-to-end model.
+
+The intended niche also defines when another package is preferable. `rentrez`
+is broader across NCBI; `pubmedR` offers a direct path from PubMed to
+`bibliometrix`; `europepmc` is the appropriate client when Europe PMC is the
+organizing index; and `openalexR` offers wider cross-disciplinary graph
+breadth. These clients can also be combined with `puremoe`, because an existing
+PMID vector can enter the workflow and returned tables use conventional R
+representations. The package is most useful when PMIDs are the organizing key
+and several NIH/NLM services are required in the same investigator-scale
+analysis.
+
+Finally, live retrieval and reproducibility should not be conflated. Executable
+code, literal queries, dates, and parameters make the process transparent, but
+a future execution queries a future state of each service. Separating retrieval
+from local work provides a practical response: researchers can retain the
+retrieved tables associated with a reported analysis while freely
+rerunning local thresholds, networks, and visualizations. The archived article
+reproduces the reported analysis, whereas a fresh execution tests the current
+workflow. Empirical studies should also archive their analysis inputs where
+licensing and data volume permit.
+
+# Conclusion
+
+`puremoe` turns a PubMed-derived or user-supplied PMID set into reusable R
+objects that can be enriched across selected NIH/NLM services and used in local
+workflows without hidden retrieval. The worked example showed the practical
+payoff: controlled vocabulary characterized the seeds, citation links exposed
+historically connected literature, PubTator3 predictions became traceable to
+sentence evidence, and a selected subset resolved to section-level PMC text.
+
+The package is best suited to moderate, investigator-scale projects in which
+PMIDs are the organizing key and two or more of these services are needed in one
+R workflow. A single-service client is simpler when only one source is required;
+a broader scholarly graph or bulk archive is preferable when coverage extends
+beyond the NIH/NLM ecosystem or approaches database scale. Within its intended
+scope, the explicit retrieval boundary and conventional returned objects let
+users preserve the empirical corpus, rerun local workflows, and inspect the
+evidence behind each summary.

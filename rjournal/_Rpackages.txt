@@ -1,0 +1,13 @@
+data.table
+dplyr
+ggplot2
+ggrepel
+igraph
+kableExtra
+knitr
+puremoe
+rjtools
+rmarkdown
+scales
+tibble
+tidyr

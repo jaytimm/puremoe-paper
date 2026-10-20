@@ -1,0 +1,30 @@
+# Working notes and drafts (kept local)
+/MANUSCRIPT_PROCESS.md
+/TODO.md
+/REVIEWER_READ.md
+/puremoe_r_journal_conversion_plan.md
+/puremoe_r_journal_outline.*
+/prototype_*
+/RJ-2017-035.pdf
+/references.bib
+
+# Submission bundle and editor correspondence
+rjournal/paper.zip
+rjournal/motivation-letter*
+
+# Build leftovers
+*.aux
+*.bbl
+*.blg
+*.brf
+*.log
+*.out
+*.knit.md
+rjournal/timm.html
+rjournal/timm_files/*
+!rjournal/timm_files/figure-latex/
+rjournal/figures/
+preprint/puremoe-preprint.Rmd
+preprint/puremoe-preprint.tex
+preprint/puremoe-preprint_files/
+.Rhistory
